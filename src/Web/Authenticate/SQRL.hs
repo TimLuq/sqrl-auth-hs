@@ -1,4 +1,4 @@
-module Web.Authentification.SQRL
+module Web.Authenticate.SQRL
 
 import Crypto.Random
 import Crypto.Cipher.AES
