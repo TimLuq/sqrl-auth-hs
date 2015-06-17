@@ -50,7 +50,9 @@ getWord32 = BG.getWord32le
 putWord32 = BP.putWord32le
 
 readKey :: Text -> Key
-readKey = B64U.decode . encodeASCII
+readKey t = case B64U.decode $ encodeASCII t of
+  Left err -> error $ "readKey: " ++ err
+  Right t' -> t'
 
 readSignature :: Text -> Signature
 readSignature = readKey
@@ -81,7 +83,7 @@ putSQRLNut :: Binary a => SQRLNutEx a -> Put
 putSQRLNut (SQRLNut { nutIP = (a, b, c, d), nutTime = ut, nutCounter = cn, nutRandom = ri, nutQR = bl, nutExtra = ex }) =
   putWord8 a <* putWord8 b <* putWord8 c <* putWord8 d
   <* putWord32 ut <* putWord32 cn
-  <* putWord32 $ (.|.) (ri .&. 0xFFFFFFFB) $ (if ex /= Nothing then 2 else 0) .|. (if nutQR then 1 else 0)
+  <* putWord32 ((.|.) (ri .&. 0xFFFFFFFB) $ (case ex of { Nothing -> 2 ; _ -> 0 }) .|. (if bl then 1 else 0))
   <* case ex of
        Nothing -> return ()
        Just xd -> put xd
@@ -104,7 +106,9 @@ sqrlKey' = unsafePerformIO $
       if isDoesNotExistError e then "sqrl-nut-key.dat not found. Generating a temporary key."
       else if isPermissionError e then "sqrl-nut-key.dat is not accessible due to permissions. Generating a temporary key."
            else "sqrl-nut-key.dat can not be read because of some unknown error (" ++ show e ++ "). Generating a temporary key."
-    modifyMVar sqrlCounter $ \(i, g) -> (\(x, g') -> ((i, g'), x)) <$> genBytes 16 g
+    modifyMVar sqrlCounter $ \(i, g) -> case (\(x, g') -> ((i, g'), x)) <$> genBytes 16 g of
+      Left err -> fail $ "sqrlIV': default IV could not be created: " ++ show err
+      Right r' -> return r'
 
 {-# NOINLINE sqrlIV' #-}
 sqrlIV' :: ByteString
@@ -114,7 +118,9 @@ sqrlIV' = unsafePerformIO $
       if isDoesNotExistError e then "sqrl-nut-iv.dat not found. Generating a temporary IV."
       else if isPermissionError e then "sqrl-nut-iv.dat is not accessible due to permissions. Generating a temporary IV."
            else "sqrl-nut-iv.dat can not be read because of some unknown error (" ++ show e ++ "). Generating a temporary IV."
-    modifyMVar sqrlCounter $ \(i, g) -> (\(x, g') -> ((i, g'), x)) <$> genBytes 16 g
+    modifyMVar sqrlCounter $ \(i, g) -> case (\(x, g') -> ((i, g'), x)) <$> genBytes 16 g of
+      Left err -> fail $ "sqrlIV': default IV could not be created: " ++ show err
+      Right r' -> return r'
 
 pad16'8 :: ByteString -> ByteString
 pad16'8 x = let l = BS.length x
@@ -124,15 +130,16 @@ pad16'8 x = let l = BS.length x
 
 -- | Create a nut for use in SQRL.
 newSQRLNut :: Binary a => IPBytes -> IO (SQRLNutEx a)
-newSQRLNut ip = newSQRLNut ip Nothing
+newSQRLNut ip = newSQRLNut' ip Nothing
 
 -- | Create a nut for use in SQRL. Extra data may be encrypted together with the nut to allow session related data to be sent.
 newSQRLNut' :: Binary a => IPBytes -> Maybe a -> IO (SQRLNutEx a)
 newSQRLNut' ip ex = do
-  (i, r) <- modifyMVar sqrlCounter incrementSQRL
+  (i, r) <- modifyMVar sqrlCounter $ \x -> return $ case incrementSQRL undefined x of { Left err -> (x, error $ "newSQRLNut': " ++ show err) ; Right y -> y }
   t <- truncate <$> getPOSIXTime
   return $ SQRLNut { nutIP = ip, nutTime = t, nutCounter = i, nutRandom = r, nutQR = False, nutExtra = ex }
-  where incrementSQRL (i, g) = (\(x, g') -> ((i+1, g'), (i, decode x))) <$> genBytes 4 g
+  where incrementSQRL :: (Integral i, Binary r, FiniteBits r, CryptoRandomGen g) => r -> (i, g) -> Either GenError ((i, g), (i, r))
+        incrementSQRL r (i, g) =  (\(x, g') -> ((i+1, g'), (i, decode $ BSL.fromStrict x))) <$> genBytes (fromIntegral $ finiteBitSize r `div` 8) g
 
 -- | A command issued by the SQRL Client.
 data SQRLCommandAction = QUERY | IDENT | DISABLE | ENABLE | REMOVE | CMD Text deriving (Show, Eq)
@@ -162,7 +169,7 @@ class SQRLServer sqrl where
   sqrlKey = const sqrlKey'
   -- | The versions supported by this server (default is only 1).
   sqrlVersion :: sqrl -> SQRLVersion
-  sqrlVersion = sqrlVersion1
+  sqrlVersion = const sqrlVersion1
   -- | If the SQRL server is runnung HTTPS.
   sqrlTLS :: sqrl -> Bool
   -- | The domain (and optional port) the SQRL server is running at.
@@ -172,7 +179,7 @@ class SQRLServer sqrl where
 
 -- | A future compatible way to run a SQRL server.
 runSQRL :: SQRLServer sqrl => sqrl -> SQRL t -> Either String t
-runSQRL = flip ($)
+runSQRL sqrl sqrlf = sqrlf sqrl
 
 type AskResponse = (Int, Maybe Text)
 -- | Reads the response of an ask. According to the spec (as of 2015-06-17) the text is not base64 encoded, just plain utf-8.
@@ -203,8 +210,10 @@ clientOption x
   | x == "sqrlonly" = SQRLONLY
   | x == "hardlock" = HARDLOCK
   | otherwise       = OPT x
+
+-- | Reads a list of none, one, or multiple 'SQRLClientOption'.
 readClientOptions :: Text -> SQRLClientOptions
-readClientOptions = map clientOption $ filter (not . T.null) . T.split ('~'==)
+readClientOptions = map clientOption . filter (not . T.null) . T.split ('~'==)
 
 -- | A structure representing the @client@ parameter sent by the SQRL client.
 data SQRLClient
@@ -237,13 +246,15 @@ data SQRLAsk
 
 -- | Reads a Base64 encoded version of the @ask=@ server option.
 readASK :: Text -> SQRLAsk
-readASK = readASK' . TE.decodeUtf8 . B64U.decode . encodeASCII
+readASK t = case B64U.decode $ encodeASCII t of
+  Left errmsg -> error $ "readASK: " ++ errmsg
+  Right t' -> readASK' $ TE.decodeUtf8 t'
 -- | Reads a text version of the server ask. See 'readASK' for a version that also decodes base64.
 readASK' :: Text -> SQRLAsk
 readASK' t = case T.split ('~'==) t of
               [x]     -> SQRLAsk x False []
               (x:b:r) -> SQRLAsk x (not (T.null b) && T.head b == '1') $ map readAskButton r
-  where readAskButton t = let (t', u) = break (';'==) t in if T.null u then (t', Nothing) else (t', Just $ T.tail u)
+  where readAskButton t = let (t', u) = T.break (';'==) t in if T.null u then (t', Nothing) else (t', Just $ T.tail u)
 
 type AskButton = (Text, Maybe Text)
 
@@ -276,25 +287,25 @@ askButtonUrl t = (,) t . Just
 
 -- | Takes a 'ByteString' (most likely from the @client@ parameter sent by the SQRL client) and returns a structure or an error message.
 mkSQRLClient :: ByteString -> Either String SQRLClient
-mkSQRLClient t = case readVersion <$> f "ver" of
-  Nothing  -> Left "mkSQRLClient: missing ver"
-  Just ver -> case readCommand <$> f "cmd" of
-    Nothing  -> Left "mkSQRLClient: missing cmd"
-    Just cmd -> case readKey <$> f "idk" of
-      Nothing  -> Left "mkSQRLClient: missing idk"
-      Just idk -> Right $ SQRLClient
-        { clientVersion      = ver
-        , clientCommand      = cmd
-        , clientOptions      = readClientOptions <$> f "opt"
-        , clientAskResponse  = readAskResponse (f "txt") <$> f "btn"
-        , clientIdentity     = idk
-        , clientPreviousID   = readKey <$> f "pidk"
-        , clientServerUnlock = readKey <$> f "suk"
-        , clientVerifyUnlock = readKey <$> f "vuk"
-        }
-  where f = flip lookup t'
-        t' = map (\x -> let (l', r') = T.breakOn ('=' ==) in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 $ B64U.decode t
-        readKey = B64U.decode
+mkSQRLClient t = case tf <$> B64U.decode t of
+  Left errmsg -> Left $ "mkSQRLClient: " ++ errmsg
+  Right f -> case readVersion <$> f "ver" of
+    Nothing  -> Left "mkSQRLClient: missing ver"
+    Just ver -> case readCommand <$> f "cmd" of
+      Nothing  -> Left "mkSQRLClient: missing cmd"
+      Just cmd -> case readKey <$> f "idk" of
+        Nothing  -> Left "mkSQRLClient: missing idk"
+        Just idk -> Right $ SQRLClient
+          { clientVersion      = ver
+          , clientCommand      = cmd
+          , clientOptions      = readClientOptions <$> f "opt"
+          , clientAskResponse  = readAskResponse (f "txt") <$> f "btn"
+          , clientIdentity     = idk
+          , clientPreviousID   = readKey <$> f "pidk"
+          , clientServerUnlock = readKey <$> f "suk"
+          , clientVerifyUnlock = readKey <$> f "vuk"
+          }
+  where tf dec = let t' = map (\x -> let (l', r') = T.break ('=' ==) x in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 $ dec in \k -> lookup k t'
 
 -- | Reads the supported version(s) of a client or server.
 readVersion :: Text -> SQRLVersion
@@ -305,15 +316,16 @@ readVersion t = case T.split (','==) t of
 
 -- | Takes a 'ByteString' (most likely from the @ids=@ parameter sent by the SQRL client) and return a structure or an error message.
 mkSQRLSignatures :: ByteString -> Either String SQRLSignatures
-mkSQRLSignatures t = case readSignature <$> f "ids" of
-  Nothing  -> Left "mkSQRLSignatures: missing ids"
-  Just ids -> Right $ SQRLSignatures
-    { signIdentity       = ids
-    , signPreviousID     = readSignature <$> f "pids"
-    , signUnlock         = readSignature <$> f "urs"
-    }
-  where f = flip lookup t'
-        t' = map (\x -> let (l', r') = T.breakOn ('=' ==) in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 $ B64U.decode t
+mkSQRLSignatures t = case tf <$> B64U.decode t of
+  Left errmsg -> Left $ "mkSQRLSignatures: " ++ errmsg
+  Right f -> case readSignature <$> f "ids" of
+    Nothing  -> Left "mkSQRLSignatures: missing ids"
+    Just ids -> Right $ SQRLSignatures
+      { signIdentity       = ids
+      , signPreviousID     = readSignature <$> f "pids"
+      , signUnlock         = readSignature <$> f "urs"
+      }
+  where tf dec = let t' = map (\x -> let (l', r') = T.break ('=' ==) x in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 $ dec in \k -> lookup k t'
 
 -- | A collection of flags conveying information about execution state of a command.
 newtype TransactionInformationFlags = TIF Int deriving (Eq, Read)
@@ -380,13 +392,14 @@ data SQRLServerData a
     }
 
 -- | Takes a 'ByteString' which contains lines of key-value pairs of data (i.e. received as the @server@ parameter sent by the SQRL client) and transforms it into a structure (or an error message).
-mkSQRLServerData :: ByteString -> SQRL (SQRLServerData a)
-mkSQRLServerData t sqrl =
-  case readVersion <$> f "ver" of
+mkSQRLServerData :: Binary a => ByteString -> SQRL (SQRLServerData a)
+mkSQRLServerData t sqrl = case tf <$> B64U.decode t of
+  Left errmsg -> Left $ "mkSQRLServerData: " ++ errmsg
+  Right (f, t') -> case readVersion <$> f "ver" of
     Nothing  -> Left "mkSQRLServerData: missing ver"
     Just ver -> case f "nut" of
       Nothing  -> Left "mkSQRLServerData: missing nut"
-      Just nt' -> let nut' = case f "nut-extra" of { Nothing -> nt' ; Just nte -> T.append nt' nte } in case f "nut-tag" of
+      Just nt' -> let nut' = readNounce $ case f "nut-extra" of { Nothing -> nt' ; Just nte -> T.append nt' nte } in case readNounce <$> f "nut-tag" of
         Nothing  -> Left "mkSQRLServerData: missing nut-tag"
         Just ntt -> case readNounce <$> f "nut-nounce" of
           Nothing  -> Left "mkSQRLServerData: missing nut-nounce"
@@ -398,12 +411,12 @@ mkSQRLServerData t sqrl =
                 Nothing  -> Left "mkSQRLServerData: missing sfn"
                 Just sfn -> let
                      (nut, tag) = decryptGCM (initAES $ sqrlKey sqrl) (iv ntt) "HS-SQRL" nut'
-                     suk = f "suk"
+                     suk = readKey <$> f "suk"
                      ask = readASK <$> f "ask"
                      pex = filter (flip notElem ["ver", "nut", "nut-extra", "nut-nounce", "nut-tag", "tif", "qry", "sfn", "suk", "ask"] . fst) t'
                    in if toBytes tag /= ntt then Left "mkSQRLServerData: tag mismatch" else Right $ SQRLServerData
                       { serverVersion      = ver
-                      , serverNut          = decode nut
+                      , serverNut          = decode $ BSL.fromStrict nut
                       , serverTransFlags   = tif
                       , serverQueryPath    = qry
                       , serverFriendlyName = sfn
@@ -411,15 +424,14 @@ mkSQRLServerData t sqrl =
                       , serverAsk          = ask
                       , serverPlainExtra   = pex
                       }
-  where f = flip lookup t'
-        t' = map (\x -> let (l', r') = T.breakOn ('=' ==) in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 $ B64U.decode t
-        readKey = B64U.decode
-        bsxor = BS.pack . BS.zipWith xor
+  where tf dec = let t' = map (\x -> let (l', r') = T.break ('=' ==) x in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 $ dec in (\k -> lookup k t', t')
+        bsxor :: ByteString -> ByteString -> ByteString
+        bsxor x y = BS.pack $ BS.zipWith xor x y
         iv nounce = let (p1, p2) = BS.splitAt (BS.length nounce) (sqrlIV sqrl) in BS.append (p1 `bsxor` nounce) p2
 
 
 -- | Creates an URL for use with SQRL (used to create a QR Code or browser links).
-sqrlURL :: SQRLNutEx a -> Nounce -> SQRL Text
+sqrlURL :: Binary a => SQRLNutEx a -> Nounce -> SQRL Text
 sqrlURL nut nounce sqrl = Right $ T.append (T.append (T.append (if sqrlTLS sqrl then "sqrl://" else "qrl://") (sqrlDomain sqrl)) path') $ TE.decodeASCII cryptUrl'
   where path = sqrlPath sqrl
         path' = if T.null path then "/" else (T.append path $ case T.findIndex ('?' ==) path of { Nothing -> "?nut=" ; _ -> "&nut=" })
@@ -446,17 +458,15 @@ htmlSQRLLogin tls domain path nut = do
   return $ a   ! class_ "sqrl" ! href (toValue $ cryptUrl nounce1 nut { nutQR = False })
          $ img ! src (toValue $ T.append "data:image/png;base64," qrdata)
   where black = rgb 0x00 0x00 0x00
-                white = rgb 0xFF 0xFF 0xFF
-                qrplt = [white, black]
-                cryptUrl = sqrlURL tls domain path
-                bwcol p l w = foldr (\n p' -> (if testBit w n then black else white) : p') p [(0 .. (l-1))]
-                qr :: Text -> AttributeValue
-                qr t = let qrc = encodeByteString (TE.encodeUtf8 t) Nothing QR_ECLEVEL_M QR_MODE_EIGHT
-                           qrl = getQRCodeWidth qrc
-                                   scanline r = let (pt0, pt1) = splitAt (qrl `div` 8) in yield $ foldr (\bits colors -> bwcol colors 8 bits) (if null pt1 then [] else bwcol [] (qrl `mod` 8) (head pt1)) pt0
-                                   scanlines = toProducer $ mapM_ scanline $ toMatrix qrc
-                       in TE.decodeASCII $ BS.concat $ runIdentity $ pngSource (mkPNGFromPalette qrl qrl qrplt scanlines) $= encodeBase64 $$ CL.consume
-                       
-
+        white = rgb 0xFF 0xFF 0xFF
+        qrplt = [white, black]
+        cryptUrl = sqrlURL tls domain path
+        bwcol p l w = foldr (\n p' -> (if testBit w n then black else white) : p') p [(0 .. (l-1))]
+        qr :: Text -> AttributeValue
+        qr t = let qrc = encodeByteString (TE.encodeUtf8 t) Nothing QR_ECLEVEL_M QR_MODE_EIGHT
+                   qrl = getQRCodeWidth qrc
+                   scanline r = let (pt0, pt1) = splitAt (qrl `div` 8) in yield $ foldr (\bits colors -> bwcol colors 8 bits) (if null pt1 then [] else bwcol [] (qrl `mod` 8) (head pt1)) pt0
+                   scanlines = toProducer $ mapM_ scanline $ toMatrix qrc
+               in TE.decodeASCII $ BS.concat $ runIdentity $ pngSource (mkPNGFromPalette qrl qrl qrplt scanlines) $= encodeBase64 $$ CL.consume
 
 -}
