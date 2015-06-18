@@ -3,6 +3,7 @@ module Web.Authenticate.SQRL where
 
 import Crypto.Random
 import Crypto.Cipher.AES
+import qualified Crypto.Sign.Ed25519 as ED25519
 import Control.Applicative
 import Control.Concurrent.MVar
 import Data.Byteable
@@ -19,7 +20,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as BSL
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64.URL as B64U
-import qualified Data.ByteString.Base64 as B64
+--import qualified Data.ByteString.Base64 as B64
 
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error
@@ -28,9 +29,9 @@ import System.IO.Unsafe (unsafePerformIO)
 import Data.String
 import Numeric
 import Data.Text.Read
-import Data.Maybe (catMaybes)
+import Data.Maybe (fromJust, catMaybes)
 
-type IPBytes = (Word8, Word8, Word8, Word8)
+newtype IPBytes = IPBytes Word32 deriving (Show, Eq)
 type UnixTime = Word32
 type Counter = Word32
 type RandomInt = Word32
@@ -45,8 +46,29 @@ type Nounce = ByteString
 type Key = ByteString
 type Signature = ByteString
 
+instance Binary IPBytes where
+  get = IPBytes <$> get
+  put (IPBytes x) = put x
+
+class IPRepresentation a where
+  fromIP :: a -> IPBytes
+
+fromIPv4 :: (Word8, Word8, Word8, Word8) -> IPBytes
+fromIPv4 (a,b,c,d) = IPBytes $ (fromIntegral a `shiftL` 24) .|. (fromIntegral b `shiftL` 16) .|. (fromIntegral c `shiftL` 8) .|. fromIntegral d
+instance IPRepresentation Word32 where
+  fromIP = IPBytes
+
+-- | An invalid IP. Use when connection may have been intercepted (when TLS is not used).
+noIP :: IPBytes
+noIP = IPBytes 0
+
+decodeASCII :: ByteString -> Text
+decodeASCII = TE.decodeUtf8
+encodeASCII :: Text -> ByteString
 encodeASCII = TE.encodeUtf8
+getWord32 :: Get Word32
 getWord32 = BG.getWord32le
+putWord32 :: Word32 -> Put
 putWord32 = BP.putWord32le
 
 readKey :: Text -> Key
@@ -80,9 +102,8 @@ instance Binary a => Binary (SQRLNutEx a) where
 
 -- | Specialiced version of 'put'.
 putSQRLNut :: Binary a => SQRLNutEx a -> Put
-putSQRLNut (SQRLNut { nutIP = (a, b, c, d), nutTime = ut, nutCounter = cn, nutRandom = ri, nutQR = bl, nutExtra = ex }) =
-  putWord8 a <* putWord8 b <* putWord8 c <* putWord8 d
-  <* putWord32 ut <* putWord32 cn
+putSQRLNut (SQRLNut { nutIP = ip, nutTime = ut, nutCounter = cn, nutRandom = ri, nutQR = bl, nutExtra = ex }) =
+  put ip  <* putWord32 ut <* putWord32 cn
   <* putWord32 ((.|.) (ri .&. 0xFFFFFFFB) $ (case ex of { Nothing -> 2 ; _ -> 0 }) .|. (if bl then 1 else 0))
   <* case ex of
        Nothing -> return ()
@@ -91,12 +112,12 @@ putSQRLNut (SQRLNut { nutIP = (a, b, c, d), nutTime = ut, nutCounter = cn, nutRa
 -- | Specialiced version of 'get'.
 getSQRLNut :: Binary a => Get (SQRLNutEx a)
 getSQRLNut = do
-  (ip, ut, en, ri) <- (,,,) <$> ((,,,) <$> getWord8 <*> getWord8 <*> getWord8 <*> getWord8) <*> getWord32 <*> getWord32 <*> getWord32
+  (ip, ut, en, ri) <- (,,,) <$> get <*> getWord32 <*> getWord32 <*> getWord32
   ex <- if ri .&. 2 == 0 then return Nothing else Just <$> get
   return $ SQRLNut { nutIP = ip, nutTime = ut, nutCounter = en, nutRandom = ri .&. 0xFFFFFFFB, nutQR = ri .&. 1 /= 0, nutExtra = ex }
 
 {-# NOINLINE sqrlCounter #-}
---sqrlCounter :: MVar Word32
+sqrlCounter :: MVar (Counter, SystemRandom)
 sqrlCounter = unsafePerformIO ((newGenIO :: IO SystemRandom) >>= newMVar . ((,) 0))
 {-# NOINLINE sqrlKey' #-}
 sqrlKey' :: ByteString
@@ -107,8 +128,62 @@ sqrlKey' = unsafePerformIO $
       else if isPermissionError e then "sqrl-nut-key.dat is not accessible due to permissions. Generating a temporary key."
            else "sqrl-nut-key.dat can not be read because of some unknown error (" ++ show e ++ "). Generating a temporary key."
     modifyMVar sqrlCounter $ \(i, g) -> case (\(x, g') -> ((i, g'), x)) <$> genBytes 16 g of
-      Left err -> fail $ "sqrlIV': default IV could not be created: " ++ show err
+      Left err -> fail $ "sqrlIV': default key could not be created: " ++ show err
       Right r' -> return r'
+
+data SQRLAuthenticated = CurrentAuth IdentityKey | PreviousAuth IdentityKey | BothAuth IdentityKey IdentityKey deriving (Show, Eq)
+data Binary a => SQRLClientPost a
+  = SQRLClientPost
+    { sqrlServerData    :: SQRLServerData a
+    , sqrlClient        :: SQRLClient
+    , sqrlSignatures    :: SQRLSignatures
+    , sqrlPostAll       :: [(ByteString, ByteString)]
+    , sqrlAuthenticated :: SQRLAuthenticated  -- ^ 
+    }
+readClientPost :: Binary a => BSL.ByteString -> SQRL (SQRLClientPost a)
+readClientPost b = \sqrl ->
+  case f "server" of
+   Nothing -> Left $ "readClientPost: no server data."
+   Just sd -> case f "client" of
+     Nothing -> Left $ "readClientPost: no client data."
+     Just cd -> case readSQRLClient <$> u cd of
+       Left err -> Left $ "readClientPost: Client decoding failed: " ++ err
+       Right (Left err) -> Left $ "readClientPost: " ++ err
+       Right (Right cl) -> case u <$> f "sign" of
+         Nothing -> Left $ "readClientPost: No signatures."
+         Just (Left err) -> Left $ "readClientPost: Signatures decoding failed: " ++ err
+         Just (Right sg) -> case readSQRLSignatures sg of
+           Left errm -> Left $ "readClientPost: " ++ errm
+           Right sig -> let signdata = BS.append sd cd
+                            cid = clientIdentity cl
+                            cauth0 = ED25519.verify' (ED25519.PublicKey cid) signdata (ED25519.Signature $ signIdentity sig)
+                            cauth1 = case ED25519.PublicKey <$> clientPreviousID cl of
+                                      Nothing  -> False
+                                      Just key -> case ED25519.Signature <$> signPreviousID sig of
+                                        Nothing -> False
+                                        Just sign -> ED25519.verify' key signdata sign
+                            cauth = if cauth1 then BothAuth cid $ fromJust $ clientPreviousID cl else CurrentAuth cid
+                        in if not cauth0 then Left $ "readClientPost: Signature verification failed for current identity"
+                           else case (\x -> runSQRL sqrl $ readSQRLServerData $ if BS.any (10==) x then x else urlcnk sqrl x) <$> u sd of
+                                 Left err -> Left $ "readClientPost: Server decoding failed: " ++ err
+                                 Right (Left err) -> Left $ "readClientPost: " ++ err
+                                 Right (Right sv) -> Right $ SQRLClientPost
+                                   { sqrlServerData    = sv
+                                   , sqrlClient        = cl
+                                   , sqrlSignatures    = sig
+                                   , sqrlPostAll       = bs
+                                   , sqrlAuthenticated = cauth
+                                   }
+  where bs = filter (\(x, y) -> not (BS.null x || BS.null y)) $ map (\z -> let (x, y) = BSL.break (eq==) z in (BSL.toStrict x, BSL.toStrict $ BSL.tail y)) $ BSL.split amp b
+        amp = fromIntegral $ fromEnum '&'
+        eq  = fromIntegral $ fromEnum '='
+        qrk = fromIntegral $ fromEnum '?'
+        f = flip lookup bs
+        u = B64U.decode
+        urlcnk sqrl url = BS.intercalate "\r\n" $ BS.split amp $ BS.tail $ BS.dropWhile (qrk/=) url
+
+clientPostData :: Binary a => ByteString -> SQRLClientPost a -> Maybe ByteString
+clientPostData k = lookup k . sqrlPostAll
 
 {-# NOINLINE sqrlIV' #-}
 sqrlIV' :: ByteString
@@ -121,6 +196,14 @@ sqrlIV' = unsafePerformIO $
     modifyMVar sqrlCounter $ \(i, g) -> case (\(x, g') -> ((i, g'), x)) <$> genBytes 16 g of
       Left err -> fail $ "sqrlIV': default IV could not be created: " ++ show err
       Right r' -> return r'
+
+sqrlGenNounce :: IO (Maybe Nounce)
+sqrlGenNounce = sqrlRandBytes 12
+
+sqrlRandBytes :: Int -> IO (Maybe ByteString)
+sqrlRandBytes l = modifyMVar sqrlCounter $ \(i, g) -> case (\(x, g') -> ((i, g'), x)) <$> genBytes l g of
+  Left err    -> (hPutStrLn stderr $ "sqrlRandBytes: random bytes could not be generated: " ++ show err) >> return ((i, g), Nothing)
+  Right (a,b) -> return $ (a, Just b)
 
 pad16'8 :: ByteString -> ByteString
 pad16'8 x = let l = BS.length x
@@ -252,9 +335,10 @@ readASK t = case B64U.decode $ encodeASCII t of
 -- | Reads a text version of the server ask. See 'readASK' for a version that also decodes base64.
 readASK' :: Text -> SQRLAsk
 readASK' t = case T.split ('~'==) t of
+              []      -> SQRLAsk "" False []
               [x]     -> SQRLAsk x False []
               (x:b:r) -> SQRLAsk x (not (T.null b) && T.head b == '1') $ map readAskButton r
-  where readAskButton t = let (t', u) = T.break (';'==) t in if T.null u then (t', Nothing) else (t', Just $ T.tail u)
+  where readAskButton x = let (t', u) = T.break (';'==) x in if T.null u then (t', Nothing) else (t', Just $ T.tail u)
 
 type AskButton = (Text, Maybe Text)
 
@@ -286,15 +370,15 @@ askButtonUrl :: Text -> Text -> AskButton
 askButtonUrl t = (,) t . Just
 
 -- | Takes a 'ByteString' (most likely from the @client@ parameter sent by the SQRL client) and returns a structure or an error message.
-mkSQRLClient :: ByteString -> Either String SQRLClient
-mkSQRLClient t = case tf <$> B64U.decode t of
-  Left errmsg -> Left $ "mkSQRLClient: " ++ errmsg
+readSQRLClient :: ByteString -> Either String SQRLClient
+readSQRLClient t = case tf <$> B64U.decode t of
+  Left errmsg -> Left $ "readSQRLClient: " ++ errmsg
   Right f -> case readVersion <$> f "ver" of
-    Nothing  -> Left "mkSQRLClient: missing ver"
+    Nothing  -> Left "readSQRLClient: missing ver"
     Just ver -> case readCommand <$> f "cmd" of
-      Nothing  -> Left "mkSQRLClient: missing cmd"
+      Nothing  -> Left "readSQRLClient: missing cmd"
       Just cmd -> case readKey <$> f "idk" of
-        Nothing  -> Left "mkSQRLClient: missing idk"
+        Nothing  -> Left "readSQRLClient: missing idk"
         Just idk -> Right $ SQRLClient
           { clientVersion      = ver
           , clientCommand      = cmd
@@ -315,11 +399,11 @@ readVersion t = case T.split (','==) t of
   where readVersion' = VersionNum . read . T.unpack
 
 -- | Takes a 'ByteString' (most likely from the @ids=@ parameter sent by the SQRL client) and return a structure or an error message.
-mkSQRLSignatures :: ByteString -> Either String SQRLSignatures
-mkSQRLSignatures t = case tf <$> B64U.decode t of
-  Left errmsg -> Left $ "mkSQRLSignatures: " ++ errmsg
+readSQRLSignatures :: ByteString -> Either String SQRLSignatures
+readSQRLSignatures t = case tf <$> B64U.decode t of
+  Left errmsg -> Left $ "readSQRLSignatures: " ++ errmsg
   Right f -> case readSignature <$> f "ids" of
-    Nothing  -> Left "mkSQRLSignatures: missing ids"
+    Nothing  -> Left "readSQRLSignatures: missing ids"
     Just ids -> Right $ SQRLSignatures
       { signIdentity       = ids
       , signPreviousID     = readSignature <$> f "pids"
@@ -337,37 +421,46 @@ instance Show TransactionInformationFlags where
 readTIF :: Text -> TransactionInformationFlags
 readTIF t = case hexadecimal t of
   Left errmsg -> error $ "readTIF: " ++ errmsg
-  Right (a,r) -> TIF a
+  Right (a,_) -> TIF a
 
 -- | When set, this indicates that the web server has found an identity association for the user based upon the default (current) identity credentials supplied by 'clientIdentity' and 'signIdentity'.
+tifCurrentIDMatch      :: TransactionInformationFlags
 tifCurrentIDMatch      = TIF 0x01
 -- | When set, this indicates that the web server has found an identity association for the user based upon the previous identity credentials supplied by 'clientPreviousID' and 'signPreviousID'.
+tifPreviousIDMatch     :: TransactionInformationFlags
 tifPreviousIDMatch     = TIF 0x02
 -- | When set, this indicates that the IP address of the entity which requested the initial logon web page containing the SQRL link URL is the same IP address from which the SQRL client's query was received for this reply.
+tifIPMatched           :: TransactionInformationFlags
 tifIPMatched           = TIF 0x04
 -- | When set, this indicates that this identity is disabled for SQRL-initiated authentication.
 --
 -- While this is set, the 'IDENT' command and any attempt at authentication will fail. This can only be reset, and the identity re-enabled for authentication, by the client issuing an 'ENABLE' command signed by the unlock request signature ('signUnlock') for the current identity. Since this signature requires the presence of the identity's RescueCode, only the strongest identity authentication is permitted to re-enable a disabled identity.
+tifSQRLDisabled        :: TransactionInformationFlags
 tifSQRLDisabled        = TIF 0x08
 -- | When set, this indicates that the client requested one or more standard SQRL functions (through command verbs) that the server does not currently support.
 --
 -- The client will likely need to advise its user that whatever they were trying to do is not possible at the target website. The SQRL server will fail this query so this also implies 'tifCommandFailed'.
+tifFunctionUnsupported :: TransactionInformationFlags
 tifFunctionUnsupported = TIF $ 0x40 + 0x010
 -- | The server replies with this bit set to indicate that the client's signature(s) are correct, but something about the client's query prevented the command from completing.
 --
 -- This is the server's way of instructing the client to retry and reissue the immediately previous command using the fresh ‘nut=’ crypto material and ‘qry=’ url the server has also just returned in its reply. The problem is likely caused by static, expired, or previously used 'SQRLNut' or qry= data. Thus, reissuing the previous command under the newly supplied server parameters would be expected to succeed. The SQRL server will not be able to complete this query so this also implies 'tifCommandFailed'.
+tifTransientError      :: TransactionInformationFlags
 tifTransientError      = TIF $ 0x40 + 0x020
 -- | When set, this bit indicates that the web server had a problem successfully processing the client's query. In any such case, no change will be made to the user's account status. All SQRL server-side actions are atomic. This means that either everything succeeds or nothing is changed. This is important since clients can request multiple updates and changes at once.
 --
 -- If this is set without 'tifClientFailure' being set the trouble was not with the client's provided data, protocol, etc. but with some other aspect of completing the client's request. With the exception of 'tifClientFailure' status, the SQRL semantics do not attempt to enumerate every conceivable web server failure reason. The web server is free to use 'serverAsk' without arguments to explain the problem to the client's user.
+tifCommandFailed       :: TransactionInformationFlags
 tifCommandFailed       = TIF 0x40
 -- | This is set by the server when some aspect of the client's submitted query ‑ other than expired but otherwise valid transaction state information ‑ was incorrect and prevented the server from understanding and/or completing the requested action.
 --
 -- This could be the result of a communications error, a mistake in the client's SQRL protocol, a signature that doesn't verify, or required signatures for the requested actions which are not present. And more specifically, this is NOT an error that the server knows would likely be fixed by having the client silently reissue its previous command; although that might still be the first recouse for the client. This is NOT an error since any such client failure will also result in a failure of the command, 'tifCommandFailed' will also be set.
+tifClientFailure       :: TransactionInformationFlags
 tifClientFailure       = TIF $ 0x40 + 0x080
 -- | This is set by the server when a SQRL identity which may be associated with the query nut does not match the SQRL ID used to submit the query.
 --
 -- If the server is maintaining session state, such as a logged on session, it may generate SQRL query nuts associated with that logged-on session's SQRL identity. If it then receives a SQRL query using that nut, but issued with a different SQRL identity, it will fail the command with this status (which also implies 'tifCommandFailed') so that the client may inform its user that the wrong SQRL identity was used with a nut that was already associated with a different identity.
+tifBadIDAssociation    :: TransactionInformationFlags
 tifBadIDAssociation    = TIF $ 0x40 + 0x100
 
 -- | Bitwise merge of two flags. @let flags = tifCurrentIDMatch `tifMerge` tifIPMatched `tifMerge` tifBadIDAssociation@
@@ -379,7 +472,7 @@ tifCheck :: TransactionInformationFlags -> TransactionInformationFlags -> Bool
 tifCheck (TIF needle) (TIF haystack) = needle == (needle .&. haystack)
 
 -- | A structure to contain all properties for the @server@ semantics as specified in SQRL 1.
-data SQRLServerData a
+data Binary a => SQRLServerData a
   = SQRLServerData
     { serverVersion      :: SQRLVersion
     , serverNut          :: SQRLNutEx a
@@ -392,29 +485,29 @@ data SQRLServerData a
     }
 
 -- | Takes a 'ByteString' which contains lines of key-value pairs of data (i.e. received as the @server@ parameter sent by the SQRL client) and transforms it into a structure (or an error message).
-mkSQRLServerData :: Binary a => ByteString -> SQRL (SQRLServerData a)
-mkSQRLServerData t sqrl = case tf <$> B64U.decode t of
-  Left errmsg -> Left $ "mkSQRLServerData: " ++ errmsg
+readSQRLServerData :: Binary a => ByteString -> SQRL (SQRLServerData a)
+readSQRLServerData t sqrl = case tf <$> B64U.decode t of
+  Left errmsg -> Left $ "readSQRLServerData: " ++ errmsg
   Right (f, t') -> case readVersion <$> f "ver" of
-    Nothing  -> Left "mkSQRLServerData: missing ver"
+    Nothing  -> Left "readSQRLServerData: missing ver"
     Just ver -> case f "nut" of
-      Nothing  -> Left "mkSQRLServerData: missing nut"
+      Nothing  -> Left "readSQRLServerData: missing nut"
       Just nt' -> let nut' = readNounce $ case f "nut-extra" of { Nothing -> nt' ; Just nte -> T.append nt' nte } in case readNounce <$> f "nut-tag" of
-        Nothing  -> Left "mkSQRLServerData: missing nut-tag"
+        Nothing  -> Left "readSQRLServerData: missing nut-tag"
         Just ntt -> case readNounce <$> f "nut-nounce" of
-          Nothing  -> Left "mkSQRLServerData: missing nut-nounce"
+          Nothing  -> Left "readSQRLServerData: missing nut-nounce"
           Just ntn -> case readTIF <$> f "tif" of
-            Nothing  -> Left "mkSQRLServerData: missing tif"
+            Nothing  -> Left "readSQRLServerData: missing tif"
             Just tif -> case f "qry" of
-              Nothing  -> Left "mkSQRLServerData: missing qry"
+              Nothing  -> Left "readSQRLServerData: missing qry"
               Just qry -> case f "sfn" of
-                Nothing  -> Left "mkSQRLServerData: missing sfn"
+                Nothing  -> Left "readSQRLServerData: missing sfn"
                 Just sfn -> let
-                     (nut, tag) = decryptGCM (initAES $ sqrlKey sqrl) (iv ntt) "HS-SQRL" nut'
+                     (nut, tag) = decryptGCM (initAES $ sqrlKey sqrl) (iv ntn) "HS-SQRL" nut'
                      suk = readKey <$> f "suk"
                      ask = readASK <$> f "ask"
                      pex = filter (flip notElem ["ver", "nut", "nut-extra", "nut-nounce", "nut-tag", "tif", "qry", "sfn", "suk", "ask"] . fst) t'
-                   in if toBytes tag /= ntt then Left "mkSQRLServerData: tag mismatch" else Right $ SQRLServerData
+                   in if toBytes tag /= ntt then Left "readSQRLServerData: tag mismatch" else Right $ SQRLServerData
                       { serverVersion      = ver
                       , serverNut          = decode $ BSL.fromStrict nut
                       , serverTransFlags   = tif
@@ -432,7 +525,7 @@ mkSQRLServerData t sqrl = case tf <$> B64U.decode t of
 
 -- | Creates an URL for use with SQRL (used to create a QR Code or browser links).
 sqrlURL :: Binary a => SQRLNutEx a -> Nounce -> SQRL Text
-sqrlURL nut nounce sqrl = Right $ T.append (T.append (T.append (if sqrlTLS sqrl then "sqrl://" else "qrl://") (sqrlDomain sqrl)) path') $ TE.decodeASCII cryptUrl'
+sqrlURL nut nounce sqrl = Right $ T.append (T.append (T.append (if sqrlTLS sqrl then "sqrl://" else "qrl://") (sqrlDomain sqrl)) path') $ decodeASCII cryptUrl'
   where path = sqrlPath sqrl
         path' = if T.null path then "/" else (T.append path $ case T.findIndex ('?' ==) path of { Nothing -> "?nut=" ; _ -> "&nut=" })
         bsxor :: ByteString -> ByteString -> ByteString
@@ -443,7 +536,8 @@ sqrlURL nut nounce sqrl = Right $ T.append (T.append (T.append (if sqrlTLS sqrl 
           let (base', tag)  = crypt
               (base, extra) = BS.splitAt 16 base'
           in (if BS.null extra then id else flip BS.append (BS.append "&nut-extra=" $ B64U.encode extra))
-             $ BS.append (B64U.encode base) $ BS.append "&nut-nounce=" $ B64U.encode nounce
+             $ BS.append (BS.append (BS.take 22 $ B64U.encode base) $ BS.append "&nut-nounce=" $ B64U.encode nounce)
+             $ BS.append "&nut-tag=" $ BS.take 22 $ B64U.encode $ toBytes tag
 
 -- * SQRL generator  
 
@@ -467,6 +561,6 @@ htmlSQRLLogin tls domain path nut = do
                    qrl = getQRCodeWidth qrc
                    scanline r = let (pt0, pt1) = splitAt (qrl `div` 8) in yield $ foldr (\bits colors -> bwcol colors 8 bits) (if null pt1 then [] else bwcol [] (qrl `mod` 8) (head pt1)) pt0
                    scanlines = toProducer $ mapM_ scanline $ toMatrix qrc
-               in TE.decodeASCII $ BS.concat $ runIdentity $ pngSource (mkPNGFromPalette qrl qrl qrplt scanlines) $= encodeBase64 $$ CL.consume
+               in decodeASCII $ BS.concat $ runIdentity $ pngSource (mkPNGFromPalette qrl qrl qrplt scanlines) $= encodeBase64 $$ CL.consume
 
 -}
