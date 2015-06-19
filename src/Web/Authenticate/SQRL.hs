@@ -22,6 +22,9 @@ import qualified Data.ByteString as BS
 import qualified Data.ByteString.Base64.URL as B64U
 --import qualified Data.ByteString.Base64 as B64
 
+import Control.Arrow (second)
+
+
 import System.IO (hPutStrLn, stderr)
 import System.IO.Error
 import System.IO.Unsafe (unsafePerformIO)
@@ -135,7 +138,7 @@ data SQRLAuthenticated = CurrentAuth IdentityKey | PreviousAuth IdentityKey | Bo
 data Binary a => SQRLClientPost a
   = SQRLClientPost
     { sqrlServerData    :: SQRLServerData a
-    , sqrlClient        :: SQRLClient
+    , sqrlClient        :: SQRLClientData
     , sqrlSignatures    :: SQRLSignatures
     , sqrlPostAll       :: [(ByteString, ByteString)]
     , sqrlAuthenticated :: SQRLAuthenticated  -- ^ 
@@ -146,7 +149,7 @@ readClientPost b = \sqrl ->
    Nothing -> Left $ "readClientPost: no server data."
    Just sd -> case f "client" of
      Nothing -> Left $ "readClientPost: no client data."
-     Just cd -> case readSQRLClient <$> u cd of
+     Just cd -> case readSQRLClientData <$> u cd of
        Left err -> Left $ "readClientPost: Client decoding failed: " ++ err
        Right (Left err) -> Left $ "readClientPost: " ++ err
        Right (Right cl) -> case u <$> f "sign" of
@@ -241,6 +244,47 @@ readCommand x         = CMD x
 
 -- | A type 
 type SQRL t = SQRLServer sqrl => sqrl -> Either String t
+type Domain = Text
+type Path = Text
+type Realm = Text
+
+
+data SQRLUrl
+  = SQRLUrl
+    { sqrlUrlSecure    :: Bool
+    , sqrlUrlDomain    :: Domain
+    , sqrlUrlRealm     :: Realm
+    , sqrlUrlPath      :: Path
+    , sqrlUrlQuery     :: Text
+    }
+  deriving (Eq, Show)
+
+sqrlUrl :: SQRLUrl -> Text
+sqrlUrl (SQRLUrl sec dom rlm pth qry) =
+  T.concat ( (if sec then "sqrl://" else "qrl://")
+           : dom : "/"
+           : (if T.null rlm then id else (\x -> rlm : "|" : x))
+           [ pth, "?", qry]
+           )
+
+readSQRLUrl :: Text -> Either String SQRLUrl
+readSQRLUrl t
+  | T.take 6 t == "qrl://"  = readUrl_0 True   $ T.drop 6 t
+  | T.take 7 t == "sqrl://" = readUrl_0 False  $ T.drop 7 t
+  | otherwise = Left "readSQRLUrl: Invalid scheme."
+  where readUrl_0 sec t' =
+          let (drp, qry) = second T.tail $ T.break ('?'==) t'
+              (dom, rap) = T.break (`elem` "/|") drp
+              (rlm, pth) = let (r', p') = T.break ('|'==) $ T.tail rap in if T.null p' then (p', r') else (r', T.tail p')
+          in if T.null dom then Left "readSQRLUrl: No domain." else if T.null qry then Left "readSQRLUrl: No querystring." else Right SQRLUrl
+             { sqrlUrlSecure = sec
+             , sqrlUrlDomain = dom
+             , sqrlUrlRealm  = rlm
+             , sqrlUrlPath   = pth
+             , sqrlUrlQuery  = qry
+             }
+
+
 
 -- | An instance of a SQRL server.
 class SQRLServer sqrl where
@@ -299,8 +343,8 @@ readClientOptions :: Text -> SQRLClientOptions
 readClientOptions = map clientOption . filter (not . T.null) . T.split ('~'==)
 
 -- | A structure representing the @client@ parameter sent by the SQRL client.
-data SQRLClient
-  = SQRLClient
+data SQRLClientData
+  = SQRLClientData
     { clientVersion       :: SQRLVersion                -- ^ The client version support.
     , clientCommand       :: SQRLCommandAction          -- ^ The command the client want to execute.
     , clientOptions       :: Maybe SQRLClientOptions    -- ^ The options requested by the client.
@@ -370,16 +414,16 @@ askButtonUrl :: Text -> Text -> AskButton
 askButtonUrl t = (,) t . Just
 
 -- | Takes a 'ByteString' (most likely from the @client@ parameter sent by the SQRL client) and returns a structure or an error message.
-readSQRLClient :: ByteString -> Either String SQRLClient
-readSQRLClient t = case tf <$> B64U.decode t of
-  Left errmsg -> Left $ "readSQRLClient: " ++ errmsg
+readSQRLClientData :: ByteString -> Either String SQRLClientData
+readSQRLClientData t = case tf <$> B64U.decode t of
+  Left errmsg -> Left $ "readSQRLClientData: " ++ errmsg
   Right f -> case readVersion <$> f "ver" of
-    Nothing  -> Left "readSQRLClient: missing ver"
+    Nothing  -> Left "readSQRLClientData: missing ver"
     Just ver -> case readCommand <$> f "cmd" of
-      Nothing  -> Left "readSQRLClient: missing cmd"
+      Nothing  -> Left "readSQRLClientData: missing cmd"
       Just cmd -> case readKey <$> f "idk" of
-        Nothing  -> Left "readSQRLClient: missing idk"
-        Just idk -> Right $ SQRLClient
+        Nothing  -> Left "readSQRLClientData: missing idk"
+        Just idk -> Right $ SQRLClientData
           { clientVersion      = ver
           , clientCommand      = cmd
           , clientOptions      = readClientOptions <$> f "opt"
