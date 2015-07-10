@@ -3,7 +3,7 @@ module Web.Authenticate.SQRL where
 
 import Crypto.Random
 import Crypto.Cipher.AES
-import qualified Crypto.Sign.Ed25519 as ED25519
+import qualified Crypto.Ed25519.Exceptions as ED25519
 import Control.Applicative
 import Control.Concurrent.MVar
 import Data.Byteable
@@ -32,22 +32,50 @@ import System.IO.Unsafe (unsafePerformIO)
 import Data.String
 import Numeric
 import Data.Text.Read
-import Data.Maybe (fromJust, catMaybes)
+import Data.Maybe (fromJust, mapMaybe, fromMaybe)
 
 newtype IPBytes = IPBytes Word32 deriving (Show, Eq)
 type UnixTime = Word32
 type Counter = Word32
 type RandomInt = Word32
-type UnlockKey = Key
-type IdentityKey = Key
-type ServerUnlockKey = Key
-type VerifyUnlockKey = Key
-type IdentitySignature = Signature
-type UnlockSignature = Signature
+newtype UnlockKey = UnlockKey { publicUnlockKey :: ByteString } deriving (Show, Eq)
+newtype IdentityKey = IdentityKey { publicIdentityKey :: ByteString } deriving (Show, Eq)
+newtype ServerUnlockKey = ServerUnlockKey { publicServerUnlockKey :: ByteString } deriving (Show, Eq)
+newtype VerifyUnlockKey = VerifyUnlockKey { publicVerifyUnlockKey :: ByteString } deriving (Show, Eq)
+
+newtype IdentitySignature = IdentitySignature { identitySignature :: ByteString } deriving (Show, Eq)
+newtype UnlockSignature   = UnlockSignature   { unlockSignature   :: ByteString } deriving (Show, Eq)
+
+class Signature s where
+  signature :: s -> ByteString
+  mkSignature :: ByteString -> s
+
+instance Signature IdentitySignature where
+  signature = identitySignature
+  mkSignature = IdentitySignature
+instance Signature UnlockSignature where
+  signature = unlockSignature
+  mkSignature = UnlockSignature
+
+class PublicKey k where
+  publicKey :: k -> ByteString
+  mkPublicKey :: ByteString -> k
+
+instance PublicKey UnlockKey where
+  publicKey = publicUnlockKey
+  mkPublicKey = UnlockKey
+instance PublicKey IdentityKey where
+  publicKey = publicIdentityKey
+  mkPublicKey = IdentityKey
+instance PublicKey ServerUnlockKey where
+  publicKey = publicServerUnlockKey
+  mkPublicKey = ServerUnlockKey
+instance PublicKey VerifyUnlockKey where
+  publicKey = publicVerifyUnlockKey
+  mkPublicKey = VerifyUnlockKey
+
 
 type Nounce = ByteString
-type Key = ByteString
-type Signature = ByteString
 
 instance Binary IPBytes where
   get = IPBytes <$> get
@@ -74,22 +102,22 @@ getWord32 = BG.getWord32le
 putWord32 :: Word32 -> Put
 putWord32 = BP.putWord32le
 
-readKey :: Text -> Key
+readKey :: PublicKey k => Text -> k
 readKey t = case B64U.decode $ encodeASCII t of
   Left err -> error $ "readKey: " ++ err
-  Right t' -> t'
+  Right t' -> mkPublicKey t'
 
-readSignature :: Text -> Signature
-readSignature = readKey
+readSignature :: Signature s => Text -> s
+readSignature = mkSignature . publicUnlockKey . readKey
 
 readNounce :: Text -> Nounce
-readNounce = readKey
+readNounce = publicUnlockKey . readKey
 
 -- | A SQRL Nut without any bound data.
 type SQRLNut = SQRLNutEx ()
 
 -- | A SQRL Nut which may have some data bound to it.
-data Binary a => SQRLNutEx a
+data SQRLNutEx a
   = SQRLNut
     { nutIP      :: IPBytes              -- ^ The IP (or 32 bits of it). This should be used when TLS is in use.
     , nutTime    :: UnixTime             -- ^ The time at which this nut was created.
@@ -117,15 +145,15 @@ getSQRLNut :: Binary a => Get (SQRLNutEx a)
 getSQRLNut = do
   (ip, ut, en, ri) <- (,,,) <$> get <*> getWord32 <*> getWord32 <*> getWord32
   ex <- if ri .&. 2 == 0 then return Nothing else Just <$> get
-  return $ SQRLNut { nutIP = ip, nutTime = ut, nutCounter = en, nutRandom = ri .&. 0xFFFFFFFB, nutQR = ri .&. 1 /= 0, nutExtra = ex }
+  return SQRLNut { nutIP = ip, nutTime = ut, nutCounter = en, nutRandom = ri .&. 0xFFFFFFFB, nutQR = ri .&. 1 /= 0, nutExtra = ex }
 
 {-# NOINLINE sqrlCounter #-}
 sqrlCounter :: MVar (Counter, SystemRandom)
-sqrlCounter = unsafePerformIO ((newGenIO :: IO SystemRandom) >>= newMVar . ((,) 0))
+sqrlCounter = unsafePerformIO ((newGenIO :: IO SystemRandom) >>= newMVar . (,) 0)
 {-# NOINLINE sqrlKey' #-}
 sqrlKey' :: ByteString
 sqrlKey' = unsafePerformIO $ 
-  catchIOError (pad16'8 <$> BS.readFile "sqrl-nut-key.dat") $ \e -> do
+  catchIOError (pad16_8 <$> BS.readFile "sqrl-nut-key.dat") $ \e -> do
     hPutStrLn stderr $
       if isDoesNotExistError e then "sqrl-nut-key.dat not found. Generating a temporary key."
       else if isPermissionError e then "sqrl-nut-key.dat is not accessible due to permissions. Generating a temporary key."
@@ -135,10 +163,10 @@ sqrlKey' = unsafePerformIO $
       Right r' -> return r'
 
 data SQRLAuthenticated = CurrentAuth IdentityKey | PreviousAuth IdentityKey | BothAuth IdentityKey IdentityKey deriving (Show, Eq)
-data Binary a => SQRLClientPost a
+data SQRLClientPost a
   = SQRLClientPost
     { sqrlServerData    :: SQRLServerData a
-    , sqrlClient        :: SQRLClientData
+    , sqrlClientData    :: SQRLClientData
     , sqrlSignatures    :: SQRLSignatures
     , sqrlPostAll       :: [(ByteString, ByteString)]
     , sqrlAuthenticated :: SQRLAuthenticated  -- ^ 
@@ -146,33 +174,34 @@ data Binary a => SQRLClientPost a
 readClientPost :: Binary a => BSL.ByteString -> SQRL (SQRLClientPost a)
 readClientPost b = \sqrl ->
   case f "server" of
-   Nothing -> Left $ "readClientPost: no server data."
+   Nothing -> Left "readClientPost: no server data."
    Just sd -> case f "client" of
-     Nothing -> Left $ "readClientPost: no client data."
+     Nothing -> Left "readClientPost: no client data."
      Just cd -> case readSQRLClientData <$> u cd of
        Left err -> Left $ "readClientPost: Client decoding failed: " ++ err
        Right (Left err) -> Left $ "readClientPost: " ++ err
        Right (Right cl) -> case u <$> f "sign" of
-         Nothing -> Left $ "readClientPost: No signatures."
+         Nothing -> Left "readClientPost: No signatures."
          Just (Left err) -> Left $ "readClientPost: Signatures decoding failed: " ++ err
          Just (Right sg) -> case readSQRLSignatures sg of
            Left errm -> Left $ "readClientPost: " ++ errm
            Right sig -> let signdata = BS.append sd cd
                             cid = clientIdentity cl
-                            cauth0 = ED25519.verify' (ED25519.PublicKey cid) signdata (ED25519.Signature $ signIdentity sig)
-                            cauth1 = case ED25519.PublicKey <$> clientPreviousID cl of
+                            maybeError err = fromMaybe (error err)
+                            cauth0 = ED25519.valid signdata (maybeError "public key size failure for cID" $ ED25519.importPublic $ publicKey cid) (ED25519.Sig $ signature $ signIdentity sig)
+                            cauth1 = case (maybeError "public key size failure for pID" . ED25519.importPublic . publicKey) <$> clientPreviousID cl of
                                       Nothing  -> False
-                                      Just key -> case ED25519.Signature <$> signPreviousID sig of
+                                      Just key -> case (ED25519.Sig . signature) <$> signPreviousID sig of
                                         Nothing -> False
-                                        Just sign -> ED25519.verify' key signdata sign
+                                        Just sign -> ED25519.valid signdata key sign
                             cauth = if cauth1 then BothAuth cid $ fromJust $ clientPreviousID cl else CurrentAuth cid
-                        in if not cauth0 then Left $ "readClientPost: Signature verification failed for current identity"
+                        in if not cauth0 then Left "readClientPost: Signature verification failed for current identity"
                            else case (\x -> runSQRL sqrl $ readSQRLServerData $ if BS.any (10==) x then x else urlcnk sqrl x) <$> u sd of
                                  Left err -> Left $ "readClientPost: Server decoding failed: " ++ err
                                  Right (Left err) -> Left $ "readClientPost: " ++ err
-                                 Right (Right sv) -> Right $ SQRLClientPost
+                                 Right (Right sv) -> Right SQRLClientPost
                                    { sqrlServerData    = sv
-                                   , sqrlClient        = cl
+                                   , sqrlClientData        = cl
                                    , sqrlSignatures    = sig
                                    , sqrlPostAll       = bs
                                    , sqrlAuthenticated = cauth
@@ -191,7 +220,7 @@ clientPostData k = lookup k . sqrlPostAll
 {-# NOINLINE sqrlIV' #-}
 sqrlIV' :: ByteString
 sqrlIV' = unsafePerformIO $ 
-  catchIOError (pad16'8 <$> BS.readFile "sqrl-nut-iv.dat") $ \e -> do
+  catchIOError (pad16_8 <$> BS.readFile "sqrl-nut-iv.dat") $ \e -> do
     hPutStrLn stderr $
       if isDoesNotExistError e then "sqrl-nut-iv.dat not found. Generating a temporary IV."
       else if isPermissionError e then "sqrl-nut-iv.dat is not accessible due to permissions. Generating a temporary IV."
@@ -205,13 +234,15 @@ sqrlGenNounce = sqrlRandBytes 12
 
 sqrlRandBytes :: Int -> IO (Maybe ByteString)
 sqrlRandBytes l = modifyMVar sqrlCounter $ \(i, g) -> case (\(x, g') -> ((i, g'), x)) <$> genBytes l g of
-  Left err    -> (hPutStrLn stderr $ "sqrlRandBytes: random bytes could not be generated: " ++ show err) >> return ((i, g), Nothing)
-  Right (a,b) -> return $ (a, Just b)
+  Left err    -> hPutStrLn stderr ("sqrlRandBytes: random bytes could not be generated: " ++ show err) >> return ((i, g), Nothing)
+  Right (a,b) -> return (a, Just b)
 
-pad16'8 :: ByteString -> ByteString
-pad16'8 x = let l = BS.length x
+pad16_8 :: ByteString -> ByteString
+pad16_8 x = let l = BS.length x
                 l_ = l `mod` 8
-                l' = if l < 16 then 16 else if l_ == 0 then l else l + 8 - l_
+                l' | l < 16 = 16
+                   | l_ == 0 = l
+                   | otherwise = l + 8 - l_
             in if l' == l then x else BS.append x $ BS.replicate (l' - l) 27
 
 -- | Create a nut for use in SQRL.
@@ -223,7 +254,7 @@ newSQRLNut' :: Binary a => IPBytes -> Maybe a -> IO (SQRLNutEx a)
 newSQRLNut' ip ex = do
   (i, r) <- modifyMVar sqrlCounter $ \x -> return $ case incrementSQRL undefined x of { Left err -> (x, error $ "newSQRLNut': " ++ show err) ; Right y -> y }
   t <- truncate <$> getPOSIXTime
-  return $ SQRLNut { nutIP = ip, nutTime = t, nutCounter = i, nutRandom = r, nutQR = False, nutExtra = ex }
+  return SQRLNut { nutIP = ip, nutTime = t, nutCounter = i, nutRandom = r, nutQR = False, nutExtra = ex }
   where incrementSQRL :: (Integral i, Binary r, FiniteBits r, CryptoRandomGen g) => r -> (i, g) -> Either GenError ((i, g), (i, r))
         incrementSQRL r (i, g) =  (\(x, g') -> ((i+1, g'), (i, decode $ BSL.fromStrict x))) <$> genBytes (fromIntegral $ finiteBitSize r `div` 8) g
 
@@ -402,7 +433,7 @@ versionCompatible :: SQRLVersion -> SQRLVersion -> Maybe VersionNum
 versionCompatible (VersionNum x) (VersionNum y) = if x == y then Just x else Nothing
 versionCompatible (VersionInterval (xl, xh)) (VersionNum y) = if xl <= y && xh >= y then Just y else Nothing
 versionCompatible (VersionInterval (xl, xh)) (VersionInterval (yl, yh)) = if xl <= yh && xh >= yl then Just (if yh < xh then yh else xh) else Nothing
-versionCompatible (VersionList xs) y = let l = catMaybes $ map (versionCompatible y) xs in if null l then Nothing else Just $ foldl max (head l) $ tail l
+versionCompatible (VersionList xs) y = let l = mapMaybe (versionCompatible y) xs in if null l then Nothing else Just $ maximum l
 versionCompatible x y = versionCompatible y x
 
 -- | A button with a specific label.
@@ -423,7 +454,7 @@ readSQRLClientData t = case tf <$> B64U.decode t of
       Nothing  -> Left "readSQRLClientData: missing cmd"
       Just cmd -> case readKey <$> f "idk" of
         Nothing  -> Left "readSQRLClientData: missing idk"
-        Just idk -> Right $ SQRLClientData
+        Just idk -> Right SQRLClientData
           { clientVersion      = ver
           , clientCommand      = cmd
           , clientOptions      = readClientOptions <$> f "opt"
@@ -433,7 +464,7 @@ readSQRLClientData t = case tf <$> B64U.decode t of
           , clientServerUnlock = readKey <$> f "suk"
           , clientVerifyUnlock = readKey <$> f "vuk"
           }
-  where tf dec = let t' = map (\x -> let (l', r') = T.break ('=' ==) x in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 $ dec in \k -> lookup k t'
+  where tf dec = let t' = map (\x -> let (l', r') = T.break ('=' ==) x in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 dec in flip lookup t'
 
 -- | Reads the supported version(s) of a client or server.
 readVersion :: Text -> SQRLVersion
@@ -448,12 +479,12 @@ readSQRLSignatures t = case tf <$> B64U.decode t of
   Left errmsg -> Left $ "readSQRLSignatures: " ++ errmsg
   Right f -> case readSignature <$> f "ids" of
     Nothing  -> Left "readSQRLSignatures: missing ids"
-    Just ids -> Right $ SQRLSignatures
+    Just ids -> Right SQRLSignatures
       { signIdentity       = ids
       , signPreviousID     = readSignature <$> f "pids"
       , signUnlock         = readSignature <$> f "urs"
       }
-  where tf dec = let t' = map (\x -> let (l', r') = T.break ('=' ==) x in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 $ dec in \k -> lookup k t'
+  where tf dec = let t' = map (\x -> let (l', r') = T.break ('=' ==) x in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 dec in flip lookup t'
 
 -- | A collection of flags conveying information about execution state of a command.
 newtype TransactionInformationFlags = TIF Int deriving (Eq, Read)
@@ -516,7 +547,7 @@ tifCheck :: TransactionInformationFlags -> TransactionInformationFlags -> Bool
 tifCheck (TIF needle) (TIF haystack) = needle == (needle .&. haystack)
 
 -- | A structure to contain all properties for the @server@ semantics as specified in SQRL 1.
-data Binary a => SQRLServerData a
+data SQRLServerData a
   = SQRLServerData
     { serverVersion      :: SQRLVersion
     , serverNut          :: SQRLNutEx a
@@ -551,7 +582,7 @@ readSQRLServerData t sqrl = case tf <$> B64U.decode t of
                      suk = readKey <$> f "suk"
                      ask = readASK <$> f "ask"
                      pex = filter (flip notElem ["ver", "nut", "nut-extra", "nut-nounce", "nut-tag", "tif", "qry", "sfn", "suk", "ask"] . fst) t'
-                   in if toBytes tag /= ntt then Left "readSQRLServerData: tag mismatch" else Right $ SQRLServerData
+                   in if toBytes tag /= ntt then Left "readSQRLServerData: tag mismatch" else Right SQRLServerData
                       { serverVersion      = ver
                       , serverNut          = decode $ BSL.fromStrict nut
                       , serverTransFlags   = tif
@@ -561,7 +592,7 @@ readSQRLServerData t sqrl = case tf <$> B64U.decode t of
                       , serverAsk          = ask
                       , serverPlainExtra   = pex
                       }
-  where tf dec = let t' = map (\x -> let (l', r') = T.break ('=' ==) x in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 $ dec in (\k -> lookup k t', t')
+  where tf dec = let t' = map (\x -> let (l', r') = T.break ('=' ==) x in (l', T.tail r')) $ filter (not . T.null) $ T.lines $ TE.decodeUtf8 dec in (flip lookup t', t')
         bsxor :: ByteString -> ByteString -> ByteString
         bsxor x y = BS.pack $ BS.zipWith xor x y
         iv nounce = let (p1, p2) = BS.splitAt (BS.length nounce) (sqrlIV sqrl) in BS.append (p1 `bsxor` nounce) p2
@@ -571,11 +602,11 @@ readSQRLServerData t sqrl = case tf <$> B64U.decode t of
 sqrlURL :: Binary a => SQRLNutEx a -> Nounce -> SQRL Text
 sqrlURL nut nounce sqrl = Right $ T.append (T.append (T.append (if sqrlTLS sqrl then "sqrl://" else "qrl://") (sqrlDomain sqrl)) path') $ decodeASCII cryptUrl'
   where path = sqrlPath sqrl
-        path' = if T.null path then "/" else (T.append path $ case T.findIndex ('?' ==) path of { Nothing -> "?nut=" ; _ -> "&nut=" })
+        path' = if T.null path then "/" else T.append path $ case T.findIndex ('?' ==) path of { Nothing -> "?nut=" ; _ -> "&nut=" }
         bsxor :: ByteString -> ByteString -> ByteString
         bsxor x y = BS.pack $ BS.zipWith xor x y
         iv = let (p1, p2) = BS.splitAt (BS.length nounce) (sqrlIV sqrl) in BS.append (p1 `bsxor` nounce) p2
-        crypt = encryptGCM (initAES $ sqrlKey sqrl) (iv) "HS-SQRL" $ BSL.toStrict $ encode $ nut
+        crypt = encryptGCM (initAES $ sqrlKey sqrl) iv "HS-SQRL" $ BSL.toStrict $ encode nut
         cryptUrl' =
           let (base', tag)  = crypt
               (base, extra) = BS.splitAt 16 base'
