@@ -102,28 +102,28 @@ modifySQRLServerData f x@SQRLClientPost { sqrlServerData = xx, sqrlPostAll = yy 
   where serverToBytes = "" -- TO DO
 -}
 
-
+-- | Modify the signatures of a 'SQRLClientPost'.
 modifySQRLSignatures :: (SQRLSignatures -> SQRLSignatures) -> SQRLClientPost a -> SQRLClientPost a
-modifySQRLSignatures f x@SQRLClientPost { sqrlSignatures = xx, sqrlPostAll = yy } = let r = f xx in x { sqrlSignatures = r, sqrlPostAll = ("ids", sigsToBytes r) : yy }
+modifySQRLSignatures f x@SQRLClientPost { sqrlSignatures = xx, sqrlPostAll = yy } = let r = f xx in x { sqrlSignatures = r, sqrlPostAll = sigsToBytes r ++ filter (flip notElem ["ids","pids","urs"] . fst) yy }
   where sigsToBytes SQRLSignatures
           { signIdentity        = csig
           , signPreviousID      = psig
           , signUnlock          = usig
-          } = enc64unpad $ BS.concat
-              [ BS.append "ids="  (enc64unpad $ signature csig)
-              , ms ((BS.append "\r\npids=" . enc64unpad . signature) <$> psig)
-              , ms ((BS.append "\r\nurs="  . enc64unpad . signature) <$> usig)
-              , "\r\n"
-              ]
-        ms = fromMaybe ""
+          } = (:) ("ids",  enc64unpad $ signature csig)
+              $ ms (((,) "pids" . enc64unpad . signature) <$> psig)
+              $ ms (((,) "urs"  . enc64unpad . signature) <$> usig)
+              []
+        ms (Just q) = (:) q
+        ms Nothing  = id
 
 modifySQRLClientData :: (SQRLClientData -> SQRLClientData) -> SQRLClientPost a -> SQRLClientPost a
-modifySQRLClientData f x@SQRLClientPost { sqrlClientData = xx, sqrlPostAll = yy } = let r = f xx in x { sqrlClientData = r, sqrlPostAll = ("client", clientToBytes r) : yy }
+modifySQRLClientData f x@SQRLClientPost { sqrlClientData = xx, sqrlPostAll = yy } = let r = f xx in x { sqrlClientData = r, sqrlPostAll = ("client", clientToBytes r) : filter ((/=) "client" . fst) yy }
   where clientToBytes SQRLClientData
           { clientVersion       = ver
           , clientCommand       = act
           , clientOptions       = opt
           , clientAskResponse   = akr
+          , clientRefererURL    = url
           , clientIdentity      = cid
           , clientPreviousID    = pid
           , clientServerUnlock  = suk
@@ -133,12 +133,38 @@ modifySQRLClientData f x@SQRLClientPost { sqrlClientData = xx, sqrlPostAll = yy 
               , "cmd=", fromString (map toLower $ show act), "\r\n"
               , ms ((flip BS.append "\r\n" . BS.append "opt=" . BS.intercalate "~" . map (fromString . show)) <$> opt)
               , ms ((flip BS.append "\r\n" . BS.append "btn=" . fromString . show . fromEnum) <$> akr)
+              , ms ((flip BS.append "\r\n" . BS.append "url=" . enc64unpad . TE.encodeUtf8) <$> url)
               , "idk=", enc64unpad (publicKey cid), "\r\n"
               , ms ((flip BS.append "\r\n" . BS.append "pidk=" . enc64unpad . publicKey) <$> pid)
               , ms ((flip BS.append "\r\n" . BS.append "suk="  . enc64unpad . publicKey) <$> suk)
               , ms ((flip BS.append "\r\n" . BS.append "vuk="  . enc64unpad . publicKey) <$> vuk)
               ]
         ms = fromMaybe ""
+
+{-
+modifySQRLServerData :: (SQRLServerData a -> SQRLServerData a) -> SQRLClientPost a -> SQRLClientPost a
+modifySQRLServerData f x@SQRLClientPost { sqrlClientData = xx, sqrlPostAll = yy } = let r = f xx in x { sqrlClientData = r, sqrlPostAll = ("client", clientToBytes r) : yy }
+  where clientToBytes SQRLServerData
+          { serverVersion       = ver
+          , serverNut           = nut
+          , serverTransFlags    = tif
+          , serverQueryPath     = qry
+          , serverFriendlyName  = sfn
+          , serverUnlockKey     = suk
+          , serverAsk           = ask
+          , serverURL           = url
+          , serverPlainExtra    = xtr
+          } = enc64unpad $ BS.concat
+              [ "ver=", toBytes ver, "\r\n"
+              , "nut=", enc64unpad $ case nut of { Left z -> TE.encodeUtf8 z ; Right z -> encode z}, "\r\n"
+              , "tif=", show tif, "\r\n"
+              , "qry=", TE.encodeUtf8 qry, "\r\n"
+              , "sfn=", TE.encodeUtf8 sfn, "\r\n"
+              , ms ((flip BS.append "\r\n" . BS.append "suk="  . enc64unpad . publicKey) <$> suk)
+              , ms ((flip BS.append "\r\n" . BS.append "ask="  . enc64unpad . publicKey) <$> ask)
+              ]
+        ms = fromMaybe ""
+-}
 
 sqrlClientPostBytes :: Binary a => SQRLClientPost a -> (SQRLClientPost a, LBS.ByteString)
 sqrlClientPostBytes p@SQRLClientPost { sqrlPostAll = pall } =
@@ -369,6 +395,7 @@ data SQRLClientData
     , clientCommand       :: SQRLCommandAction          -- ^ The command the client want to execute.
     , clientOptions       :: Maybe SQRLClientOptions    -- ^ The options requested by the client.
     , clientAskResponse   :: Maybe AskResponse          -- ^ Any response to a message or confirmation that needed to be shown to the user.
+    , clientRefererURL    :: Maybe Text                 -- ^ The client will include a “url=” parameter in the initial “query” command of any identity authentication initiated by the SQRL client's receipt of a web browser's HTML query on port 25519 of the localhost IP 127.0.0.1 when that HTML query contains a “Referer:” header and no “Origin:” header.
     , clientIdentity      :: IdentityKey                -- ^ The current identity of the user.
     , clientPreviousID    :: Maybe IdentityKey          -- ^ The previous identity of the user if the identity has been changed.
     , clientServerUnlock  :: Maybe ServerUnlockKey      -- ^ The key used to unlock the users identity.
@@ -459,6 +486,7 @@ readSQRLClientData t = case tf <$> dec64unpad t of
           , clientCommand      = cmd
           , clientOptions      = readClientOptions <$> f "opt"
           , clientAskResponse  = (askResponse . read . T.unpack) <$> f "btn"
+          , clientRefererURL   = f "url"
           , clientIdentity     = idk
           , clientPreviousID   = readKey "readSQRLClientData(pidk)" <$> f "pidk"
           , clientServerUnlock = readKey "readSQRLClientData(suk)" <$> f "suk"
@@ -546,12 +574,12 @@ tifSQRLDisabled        = TIF 0x08
 --
 -- The client will likely need to advise its user that whatever they were trying to do is not possible at the target website. The SQRL server will fail this query so this also implies 'tifCommandFailed'.
 tifFunctionUnsupported :: TransactionInformationFlags
-tifFunctionUnsupported = TIF $ 0x40 + 0x010
+tifFunctionUnsupported = TIF $ 0x40 .|. 0x010
 -- | The server replies with this bit set to indicate that the client's signature(s) are correct, but something about the client's query prevented the command from completing.
 --
 -- This is the server's way of instructing the client to retry and reissue the immediately previous command using the fresh ‘nut=’ crypto material and ‘qry=’ url the server has also just returned in its reply. The problem is likely caused by static, expired, or previously used 'SQRLNut' or qry= data. Thus, reissuing the previous command under the newly supplied server parameters would be expected to succeed. The SQRL server will not be able to complete this query so this also implies 'tifCommandFailed'.
 tifTransientError      :: TransactionInformationFlags
-tifTransientError      = TIF $ 0x40 + 0x020
+tifTransientError      = TIF $ 0x40 .|. 0x020
 -- | When set, this bit indicates that the web server had a problem successfully processing the client's query. In any such case, no change will be made to the user's account status. All SQRL server-side actions are atomic. This means that either everything succeeds or nothing is changed. This is important since clients can request multiple updates and changes at once.
 --
 -- If this is set without 'tifClientFailure' being set the trouble was not with the client's provided data, protocol, etc. but with some other aspect of completing the client's request. With the exception of 'tifClientFailure' status, the SQRL semantics do not attempt to enumerate every conceivable web server failure reason. The web server is free to use 'serverAsk' without arguments to explain the problem to the client's user.
@@ -561,12 +589,20 @@ tifCommandFailed       = TIF 0x40
 --
 -- This could be the result of a communications error, a mistake in the client's SQRL protocol, a signature that doesn't verify, or required signatures for the requested actions which are not present. And more specifically, this is NOT an error that the server knows would likely be fixed by having the client silently reissue its previous command; although that might still be the first recouse for the client. This is NOT an error since any such client failure will also result in a failure of the command, 'tifCommandFailed' will also be set.
 tifClientFailure       :: TransactionInformationFlags
-tifClientFailure       = TIF $ 0x40 + 0x080
+tifClientFailure       = TIF $ 0x40 .|. 0x080
 -- | This is set by the server when a SQRL identity which may be associated with the query nut does not match the SQRL ID used to submit the query.
 --
 -- If the server is maintaining session state, such as a logged on session, it may generate SQRL query nuts associated with that logged-on session's SQRL identity. If it then receives a SQRL query using that nut, but issued with a different SQRL identity, it will fail the command with this status (which also implies 'tifCommandFailed') so that the client may inform its user that the wrong SQRL identity was used with a nut that was already associated with a different identity.
 tifBadIDAssociation    :: TransactionInformationFlags
-tifBadIDAssociation    = TIF $ 0x40 + 0x100
+tifBadIDAssociation    = TIF $ 0x40 .|. 0x100
+-- | This bit provides the SQRL client with the reason for its command failure. It is set by the server when the SQRL client has obtained the origin domain of the SQRL link, probably from the link's HREF Referer: header, forwarded it to the server in its query's “url=” parameter, and the server does not recognize the provided origin domain as valid for its SQRL links. The server fails the command, returning both this bit along with 'tifCommandFailed'. The SQRL client should inform its user that SQRL logon link was invalid.
+tifInvalidLinkOrigin   :: TransactionInformationFlags
+tifInvalidLinkOrigin   = TIF $ 0x40 .|. 0x200
+-- | This bit allows the authenticating website to suppress the SQRL client's additional user prompting for confirmation of the remote site's server friendly name (SFN) as returned in the server's “sfn=” parameter.
+--
+-- In practice it will eliminate additional logon steps and delays when the server determines these are unneeded. Since this potentially eliminates last-chance user-caught site spoofing, the server must only return this bit set when it is confident that any and all additional last-chance verification is unnecessary. This bit would normally not be set in cross-device logon where the SQRL link's origin domain cannot be determined and where client provided session (CPS) cannot be provided, and thus where the SQRL client would omit the “opt=cps” and “url=” query parameters. However, non-web logon uses of the SQRL system may employ alternative verification measures, therefore all logon modes, including cross-device, should honor this bit and suppress last-chance SFN verification when this bit is present. The responsibility for this is the server's.
+tifSuppressSFN         :: TransactionInformationFlags
+tifSuppressSFN         = TIF 0x400
 
 -- | Bitwise merge of two flags. @let flags = tifCurrentIDMatch `tifMerge` tifIPMatched `tifMerge` tifBadIDAssociation@
 tifMerge :: TransactionInformationFlags -> TransactionInformationFlags -> TransactionInformationFlags
@@ -583,9 +619,15 @@ data SQRLServerData a
     , serverNut          :: SQRLNutEx a
     , serverTransFlags   :: TransactionInformationFlags
     , serverQueryPath    :: Text
+      -- ^ The “qry” parameter instructs the client what server object to query in its next (if any) query. To mitigate the potential for tampering, this qry parameter supplies the full path from the root and the object, not the scheme, domain name, or port. The scheme, domain and optional port override may only be specified once in the initial URL and cannot subsequently be changed.
     , serverFriendlyName :: Text
+      -- ^ The value of this parameter is the common name by which the website is known. For example “Amazon”, “Yahoo!”, “Google”, etc. This will be displayed to the user to confirm the site they are about to authenticate to. Since the client returns this data with every command query, the web server can verify that the sfn it sent has not been tampered with and that the user saw the site's intended name.
     , serverUnlockKey    :: Maybe UnlockKey
+      -- ^ The suk value is originally generated and provided to the server by the SQRL client whenever the client is creating a new identity association or modifying an existing association.
     , serverAsk          :: Maybe SQRLAsk
+      -- ^ The ask parameter implements a simple but flexible means for a remote server to prompt the user with a free-form question or action confirmation message. This flexible ask facility allows the server to obtain client-signed confirmations of the user's intent through the SQRL client-server channel in situations where the web browser-to-server channel cannot offer sufficient security.
+    , serverURL          :: Maybe Text
+      -- ^ This value must be provided by the server in its response to any command other than “query” when the SQRL client command includes the “opt=cps” (client provided session) parameter indicating that the identity authentication was triggered by a web browser's HTML HREF request. The web browser will be awaiting a reply, which will take the form of a 301 Moved Permanently redirect to this “url=URL”, supplied by the server. The server must always supply this redirection URL, but if it does not, and if the web browser's query contained a Referer: header, the SQRL client will, as an emergency measure, return the web browser to the same page it came from as specified by the received Referer: header.
     , serverPlainExtra   :: [(Text, Text)]
     }
   deriving (Show)
@@ -624,6 +666,7 @@ readSQRLServerData cryptoKey cryptoIV t = case tf <$> dec64unpad t of
                       , serverFriendlyName = sfn
                       , serverUnlockKey    = suk
                       , serverAsk          = ask
+                      , serverURL          = f "url"
                       , serverPlainExtra   = pex
                       }
   where tf dec = let t' = map (\x -> let (l', r') = T.break ('=' ==) x in (l', T.tail r')) $ filter (not . T.null) $ T.splitOn "\r\n" $
