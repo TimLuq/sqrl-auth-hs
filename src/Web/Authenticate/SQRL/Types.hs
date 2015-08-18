@@ -423,16 +423,15 @@ data SQRLAsk
 
 -- | Reads a Base64 encoded version of the @ask=@ server option.
 readASK :: Text -> SQRLAsk
-readASK t = case dec64unpad $ encodeASCII "readASK" t of
-  Left errmsg -> error $ "readASK: " ++ errmsg
-  Right t' -> readASK' $ case TE.decodeUtf8' t' of { Left e -> error $ "readASK: utf8 error: " ++ show e ; Right e -> e }
--- | Reads a text version of the server ask. See 'readASK' for a version that also decodes base64.
-readASK' :: Text -> SQRLAsk
-readASK' t = case T.split ('~'==) t of
-              []    -> SQRLAsk "" []
-              [x]   -> SQRLAsk x []
-              (x:r) -> SQRLAsk x $ map readAskButton r
+readASK t = case map (toRight (error . (++) "readASK: utf8 error: " . show) . TE.decodeUtf8' . toRight (error . (++) "readASK: ") . dec64unpad . encodeASCII "readASK") $ T.split ('~'==) t of
+             []    -> SQRLAsk "" []
+             [x]   -> SQRLAsk x []
+             (x:r) -> SQRLAsk x $ map readAskButton r
   where readAskButton x = let (t', u) = T.break (';'==) x in if T.null u then (t', Nothing) else (t', Just $ T.tail u)
+        toRight :: (a -> b) -> Either a b -> b
+        toRight f x = case x of
+          Left xl -> f xl
+          Right y -> y
 
 type AskButton = (Text, Maybe Text)
 
